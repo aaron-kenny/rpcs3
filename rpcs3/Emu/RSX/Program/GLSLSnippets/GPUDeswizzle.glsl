@@ -24,6 +24,7 @@ layout(%push_block) uniform parameters
 struct invocation_properties
 {
 	uint data_offset;
+	uint data_end;
 	uvec3 size;
 	uvec3 size_log2;
 };
@@ -56,6 +57,7 @@ bool init_invocation_properties(const in uint offset)
 		level++;
 	}
 
+	invocation.data_end = level_end;
 	return (offset < level_end);
 }
 
@@ -101,17 +103,56 @@ uint get_z_index(const in uint x_, const in uint y_, const in uint z_)
 	return offset;
 }
 
+// Returns the location of the swizzled input texel that maps to a texel in the linear output stream.
+// The invocation properties must already be initialized for the mip level that contains the output texel.
+uint get_src_texel_id(const in uint texel_id)
+{
+	// Calculations done in texels, not bytes
+	uint row_length = invocation.size.x;
+	uint slice_length = (invocation.size.y * row_length);
+	uint level_offset = (texel_id - invocation.data_offset);
+	uint slice_offset = (level_offset % slice_length);
+	uint z = (level_offset / slice_length);
+	uint y = (slice_offset / row_length);
+	uint x = (slice_offset % row_length);
+
+	return get_z_index(x, y, z) + invocation.data_offset;
+}
+
+#if (USE_8BIT_ADDRESSING || USE_16BIT_ADDRESSING)
+
+// Several texels are packed into each output word, but they are not guaranteed to be neighbours on the same row.
+// Mip levels narrower than one word wrap to the next row, slice or even the next mip level in the middle of the word.
+// Each texel therefore has to be resolved individually or the tail of the mip chain is left undefined.
+bool seek_texel(const in uint texel_id)
+{
+	if (texel_id < invocation.data_end)
+	{
+		// Same mip level as the previous texel
+		return true;
+	}
+
+	return init_invocation_properties(texel_id);
+}
+
+#endif
+
 #if USE_16BIT_ADDRESSING
 
-void decode_16b(const in uint texel_id, in uint x, const in uint y, const in uint z)
+void decode_16b(const in uint texel_id)
 {
 	uint accumulator = 0;
 
-	const uint subword_count = min(invocation.size.x, 2);
-	for (uint subword = 0; subword < subword_count; ++subword, ++x)
+	for (uint subword = 0; subword < 2; ++subword)
 	{
-		uint src_texel_id = get_z_index(x, y, z);
-		uint src_id = (src_texel_id + invocation.data_offset);
+		const uint dst_texel_id = texel_id + subword;
+		if (!seek_texel(dst_texel_id))
+		{
+			// End of data
+			break;
+		}
+
+		uint src_id = get_src_texel_id(dst_texel_id);
 		int src_bit_offset = int(src_id % 2) << 4;
 		uint src_value = bitfieldExtract(data_in[src_id / 2], src_bit_offset, 16);
 		accumulator = bitfieldInsert(accumulator, src_value, int(subword << 4), 16);
@@ -122,15 +163,20 @@ void decode_16b(const in uint texel_id, in uint x, const in uint y, const in uin
 
 #elif USE_8BIT_ADDRESSING
 
-void decode_8b(const in uint texel_id, in uint x, const in uint y, const in uint z)
+void decode_8b(const in uint texel_id)
 {
 	uint accumulator = 0;
 
-	const uint subword_count = min(invocation.size.x, 4);
-	for (uint subword = 0; subword < subword_count; ++subword, ++x)
+	for (uint subword = 0; subword < 4; ++subword)
 	{
-		uint src_texel_id = get_z_index(x, y, z);
-		uint src_id = (src_texel_id + invocation.data_offset);
+		const uint dst_texel_id = texel_id + subword;
+		if (!seek_texel(dst_texel_id))
+		{
+			// End of data
+			break;
+		}
+
+		uint src_id = get_src_texel_id(dst_texel_id);
 		int src_bit_offset = int(src_id % 4) << 3;
 		uint src_value = bitfieldExtract(data_in[src_id / 4], src_bit_offset, 8);
 		accumulator = bitfieldInsert(accumulator, src_value, int(subword << 3), 8);
@@ -141,11 +187,10 @@ void decode_8b(const in uint texel_id, in uint x, const in uint y, const in uint
 
 #else
 
-void decode_32b(const in uint texel_id, const in uint word_count, const in uint x, const in uint y, const in uint z)
+void decode_32b(const in uint texel_id, const in uint word_count)
 {
-	uint src_texel_id = get_z_index(x, y, z);
 	uint dst_id = (texel_id * word_count);
-	uint src_id = (src_texel_id + invocation.data_offset) * word_count;
+	uint src_id = get_src_texel_id(texel_id) * word_count;
 
 	for (uint i = 0; i < word_count; ++i)
 	{
@@ -171,21 +216,12 @@ void main()
 	if (!init_invocation_properties(texel_id))
 		return;
 
-	// Calculations done in texels, not bytes
-	uint row_length = invocation.size.x;
-	uint slice_length = (invocation.size.y * row_length);
-	uint level_offset = (texel_id - invocation.data_offset);
-	uint slice_offset = (level_offset % slice_length);
-	uint z = (level_offset / slice_length);
-	uint y = (slice_offset / row_length);
-	uint x = (slice_offset % row_length);
-
 #if USE_8BIT_ADDRESSING
-	decode_8b(texel_id, x, y, z);
+	decode_8b(texel_id);
 #elif USE_16BIT_ADDRESSING
-	decode_16b(texel_id, x, y, z);
+	decode_16b(texel_id);
 #else
-	decode_32b(texel_id, word_count, x, y, z);
+	decode_32b(texel_id, word_count);
 #endif
 
 }

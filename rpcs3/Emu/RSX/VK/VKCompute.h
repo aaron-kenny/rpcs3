@@ -451,8 +451,13 @@ namespace vk
 		{
 			set_parameters(cmd);
 
-			m_program->bind_uniform({ *src_buffer, in_offset, block_length }, 0, 0);
-			m_program->bind_uniform({ *dst_buffer, out_offset, block_length }, 0, 1);
+			// The kernel addresses both buffers as arrays of 32-bit words.
+			// Mip chains of 8-bit and 16-bit texels usually end on a partial word (e.g the 1x1 level), so the range must be padded to cover it.
+			// Otherwise the tail access is out of bounds and gets dropped when robust buffer access is active.
+			const u32 ssbo_range = utils::align<u32>(block_length, 4);
+
+			m_program->bind_uniform({ *src_buffer, in_offset, ssbo_range }, 0, 0);
+			m_program->bind_uniform({ *dst_buffer, out_offset, ssbo_range }, 0, 1);
 		}
 
 		void set_parameters(const vk::command_buffer& cmd)
